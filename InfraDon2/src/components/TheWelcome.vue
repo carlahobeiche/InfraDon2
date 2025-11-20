@@ -1,89 +1,219 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import PouchDB from 'pouchdb'
+import PouchDBFind from 'pouchdb-find'
+
+// --- plugin d'indexation ---
+;(PouchDB as any).plugin(PouchDBFind)
 
 // ---------- Types ----------
+interface Comment {
+  text: string
+  created_at: string
+}
+
 declare interface Post {
   _id?: string
   _rev?: string
   post_name: string
   post_content: string
   attributes: string[]
+  created_at?: string
+  updated_at?: string
+  likes?: number
+  comments?: Comment[]
 }
 
-// ---------- State ----------
-const storage = ref<PouchDB.Database | null>(null)
-const postsData = ref<Post[]>([])
+// ---------- Constantes DB ----------
+const LOCAL_DB_NAME = 'infradon2_local' // DB applicative (offline)
+const REMOTE_DB_URL = 'http://admin:Ilovecash1925@localhost:5984/infrandon2_db1' // CouchDB distante
 
+// ---------- State ----------
+const localDb = ref<PouchDB.Database | null>(null)
+const remoteDb = ref<PouchDB.Database | null>(null)
+const syncHandler = ref<any>(null)
+
+const postsData = ref<Post[]>([])
 const newPost = ref<Post>({
   post_name: '',
   post_content: '',
-  attributes: []
+  attributes: [],
 })
 
 const editingPost = ref<Post | null>(null)
 
-// ---------- Init DB ----------
-const initDatabase = () => {
-  console.log('=> Connexion à la base de données')
-  // ⚠️ Garde ton URL/base ou adapte si besoin
-  const db = new PouchDB('http://admin:Ilovecash1925@localhost:5984/infrandon2_db1')
-  if (db) {
-    console.log('Connecté à la collection : ' + db.name)
-    storage.value = db
+const loading = ref(false)
+const error = ref<string | null>(null)
+
+const online = ref(true)           // toggle online/offline
+const searchTerm = ref('')         // recherche par post_name
+const sortByLikes = ref(false)     // tri par likes
+
+// brouillon de commentaire par document
+const commentDrafts = ref<Record<string, string>>({})
+
+// ---------- Helpers ----------
+const normalizePost = (raw: any): Post => {
+  const likes =
+    typeof raw.likes === 'number' && !Number.isNaN(raw.likes) ? raw.likes : 0
+  const comments = Array.isArray(raw.comments)
+    ? (raw.comments as Comment[])
+    : []
+
+  return {
+    ...raw,
+    likes,
+    comments,
+    attributes: Array.isArray(raw.attributes) ? raw.attributes : [],
+  } as Post
+}
+
+const initLocalDb = () => {
+  if (!localDb.value) {
+    localDb.value = new PouchDB(LOCAL_DB_NAME)
+  }
+  return localDb.value
+}
+
+const initRemoteDb = () => {
+  if (!remoteDb.value) {
+    remoteDb.value = new PouchDB(REMOTE_DB_URL)
+  }
+  return remoteDb.value
+}
+
+// ---------- Indexation ----------
+const ensureIndexes = async () => {
+  const db = initLocalDb()
+  // index sur nom (recherche) et likes (tri)
+  await (db as any).createIndex({ index: { fields: ['post_name'] } })
+  await (db as any).createIndex({ index: { fields: ['likes'] } })
+}
+
+// ---------- Réplication ----------
+const replicateFromRemote = async () => {
+  const local = initLocalDb()
+  const remote = initRemoteDb()
+  await local.replicate.from(remote)
+}
+
+const replicateToRemote = async () => {
+  const local = initLocalDb()
+  const remote = initRemoteDb()
+  await local.replicate.to(remote)
+}
+
+// sync deux sens (one shot)
+const manualSync = async () => {
+  await replicateFromRemote()
+  await replicateToRemote()
+}
+
+// sync live (online)
+const startLiveSync = () => {
+  const local = initLocalDb()
+  const remote = initRemoteDb()
+  syncHandler.value = (local as any)
+    .sync(remote, { live: true, retry: true })
+    .on('change', () => {
+      fetchData()
+    })
+    .on('error', (e: any) => {
+      console.error('sync error', e)
+    })
+}
+
+const stopLiveSync = () => {
+  if (syncHandler.value && typeof syncHandler.value.cancel === 'function') {
+    syncHandler.value.cancel()
+  }
+}
+
+// toggle online/offline
+const toggleOnline = async () => {
+  online.value = !online.value
+  if (online.value) {
+    await manualSync()
+    startLiveSync()
   } else {
-    console.warn('Échec lors de la connexion à la base de données')
+    stopLiveSync()
   }
 }
 
-// ---------- Read ----------
+// ---------- CRUD ----------
+
+// READ – toutes les données (local DB)
 const fetchData = async () => {
-  if (!storage.value) return console.warn('Base de données non initialisée')
-
+  const db = initLocalDb()
+  loading.value = true
+  error.value = null
   try {
-    const result = await storage.value.allDocs({ include_docs: true })
-    postsData.value = result.rows
-      .map((row: any) => row.doc as Post)
-      .filter((doc: unknown): doc is Post => !!doc)
-    console.log('📥 Documents récupérés :', postsData.value)
-  } catch (error) {
-    console.error('❌ Erreur lors de la récupération des données :', error)
+    if (sortByLikes.value) {
+      // tri par likes côté DB
+      const res = await (db as any).find({
+        selector: {
+          likes: { $gte: 0 },
+        },
+        sort: [{ likes: 'desc' }],
+      })
+      postsData.value = (res.docs as any[]).map(normalizePost)
+    } else {
+      const result = await db.allDocs({ include_docs: true })
+      postsData.value = result.rows
+        .filter((r: any) => r.doc)
+        .map((r: any) => normalizePost(r.doc))
+        .sort(
+          (a, b) =>
+            new Date(b.created_at || '').getTime() -
+            new Date(a.created_at || '').getTime()
+        )
+    }
+  } catch (e: any) {
+    console.error(e)
+    error.value = 'Erreur fetchData : ' + e.message
+  } finally {
+    loading.value = false
   }
 }
 
-// ---------- Create ----------
+// CREATE – ajout via local DB
 const addPost = async () => {
-  if (!storage.value) return
+  const db = initLocalDb()
 
-  const doc: Post = {
-    _id: new Date().toISOString(), // ID unique simple
-    post_name: newPost.value.post_name.trim(),
-    post_content: newPost.value.post_content.trim(),
-    attributes: (newPost.value.attributes || [])
-      .map(a => String(a).trim())
-      .filter(Boolean)
-  }
+  const now = new Date().toISOString()
+  const attrs = (newPost.value.attributes || [])
+    .map(a => String(a).trim())
+    .filter(Boolean)
 
-  if (!doc.post_name || !doc.post_content) {
+  if (!newPost.value.post_name.trim() || !newPost.value.post_content.trim()) {
     console.warn('Champs requis manquants')
     return
   }
 
+  const doc: Omit<Post, '_id' | '_rev'> = {
+    post_name: newPost.value.post_name.trim(),
+    post_content: newPost.value.post_content.trim(),
+    attributes: attrs,
+    created_at: now,
+    likes: 0,
+    comments: [],
+  }
+
   try {
-    await storage.value.put(doc)
-    // Reset formulaire
+    await (db as any).post(doc)
+    // reset formulaire
     newPost.value.post_name = ''
     newPost.value.post_content = ''
     newPost.value.attributes = []
     await fetchData()
-  } catch (error) {
-    console.error('❌ Erreur lors de l’ajout :', error)
+    if (online.value) await manualSync()
+  } catch (error: any) {
+    console.error(error)
   }
 }
 
-// ---------- Update (edit inline) ----------
+// UPDATE (mode édition)
 const startEdit = (post: Post) => {
-  // copie profonde simple
   editingPost.value = JSON.parse(JSON.stringify(post))
 }
 
@@ -92,58 +222,178 @@ const cancelEdit = () => {
 }
 
 const updatePost = async () => {
-  if (!storage.value) return
+  const db = initLocalDb()
   const doc = editingPost.value
-  if (!doc || !doc._id || !doc._rev) {
-    console.warn('⚠️ _id et _rev requis pour la mise à jour')
+  if (!doc || !doc._id) {
+    console.warn('_id manquant pour update')
     return
   }
 
-  // nettoyage minimal
-  doc.post_name = doc.post_name.trim()
-  doc.post_content = doc.post_content.trim()
-  doc.attributes = (doc.attributes || []).map(a => String(a).trim()).filter(Boolean)
-
   try {
-    const res = await storage.value.put(doc)
-    console.log('✅ Document mis à jour :', res)
+    // récupérer doc frais (pour likes/comments)
+    const existing = await db.get(doc._id)
+    const normalized = normalizePost(existing)
+
+    const updated: Post = {
+      _id: doc._id,
+      _rev: existing._rev,
+      post_name: doc.post_name.trim(),
+      post_content: doc.post_content.trim(),
+      attributes: (doc.attributes || []).map(a => String(a).trim()),
+      created_at: normalized.created_at || new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      likes: normalized.likes,
+      comments: normalized.comments,
+    }
+
+    await db.put(updated as any)
     editingPost.value = null
     await fetchData()
-  } catch (error) {
-    console.error('❌ Erreur lors de la mise à jour :', error)
-    // Optionnel: gestion simple des conflits (_conflict)
+    if (online.value) await manualSync()
+  } catch (error: any) {
+    console.error('Erreur updatePost :', error)
   }
 }
 
-// ---------- Delete ----------
+// DELETE
 const deletePost = async (docId?: string, docRev?: string) => {
-  if (!storage.value || !docId || !docRev) return
-
+  if (!docId || !docRev) return
+  const db = initLocalDb()
   try {
-    await storage.value.remove(docId, docRev)
+    await db.remove(docId, docRev)
     await fetchData()
-  } catch (error) {
-    console.error('❌ Erreur lors de la suppression :', error)
+    if (online.value) await manualSync()
+  } catch (error: any) {
+    console.error('Erreur deletePost :', error)
   }
 }
 
-onMounted(async () => {
-  console.log('=> Composant initialisé')
-  initDatabase()
+// ---------- Likes ----------
+const likePost = async (post: Post) => {
+  if (!post._id) return
+  const db = initLocalDb()
+  try {
+    const fresh = await db.get(post._id)
+    const norm = normalizePost(fresh)
+    const updated: Post = {
+      ...norm,
+      likes: (norm.likes || 0) + 1,
+    }
+    await db.put(updated as any)
+    await fetchData()
+    if (online.value) await manualSync()
+  } catch (e: any) {
+    console.error('Erreur likePost :', e)
+  }
+}
+
+const toggleSortLikes = async () => {
+  sortByLikes.value = !sortByLikes.value
   await fetchData()
+}
+
+// ---------- Commentaires ----------
+const getCommentDraft = (docId?: string) =>
+  docId ? commentDrafts.value[docId] || '' : ''
+
+const setCommentDraft = (docId: string, value: string) => {
+  commentDrafts.value = { ...commentDrafts.value, [docId]: value }
+}
+
+const addComment = async (post: Post) => {
+  if (!post._id) return
+  const draft = getCommentDraft(post._id).trim()
+  if (!draft) return
+  const db = initLocalDb()
+  try {
+    const fresh = await db.get(post._id)
+    const norm = normalizePost(fresh)
+    const newComment: Comment = {
+      text: draft,
+      created_at: new Date().toISOString(),
+    }
+    const updated: Post = {
+      ...norm,
+      comments: [...(norm.comments || []), newComment],
+    }
+    await db.put(updated as any)
+    setCommentDraft(post._id, '')
+    await fetchData()
+    if (online.value) await manualSync()
+  } catch (e: any) {
+    console.error('Erreur addComment :', e)
+  }
+}
+
+// ---------- Factory / Seed ----------
+const seedFactory = async (n = 20) => {
+  const db = initLocalDb()
+  const t = Date.now()
+  const docs: Post[] = Array.from({ length: n }).map((_, i) => ({
+    _id: 'seed_' + (t + i),
+    post_name: `Post ${i}`,
+    post_content: `Contenu ${i}`,
+    attributes: ['demo', `tag${i}`],
+    created_at: new Date().toISOString(),
+    likes: Math.floor(Math.random() * 10),
+    comments: [],
+  }))
+  await (db as any).bulkDocs(docs)
+  await fetchData()
+  if (online.value) await manualSync()
+}
+
+// ---------- Recherche (indexée) ----------
+const onSearchInput = async () => {
+  const db = initLocalDb()
+  const term = searchTerm.value.trim()
+  if (!term) {
+    await fetchData()
+    return
+  }
+  // recherche via index post_name
+  const res = await (db as any).find({
+    selector: {
+      post_name: { $eq: term },
+    },
+  })
+  postsData.value = (res.docs as any[]).map(normalizePost)
+}
+
+// ---------- Lifecycle ----------
+onMounted(async () => {
+  initLocalDb()
+  initRemoteDb()
+  await ensureIndexes()
+  await manualSync()
+  await fetchData()
+  startLiveSync()
 })
 </script>
 
 <template>
   <div class="container">
-    <h1>📡 CouchDB + Vue 3 (CRUD)</h1>
+    <h1>CouchDB + Vue 3 (CRUD + Réplication + Indexation)</h1>
 
-    <!-- Actions -->
-    <div class="actions">
-      <button @click="fetchData">🔄 Rafraîchir</button>
-    </div>
+    <!-- Status + mode online/offline -->
+    <section class="status-bar">
+      <p v-if="loading" class="info">Chargement…</p>
+      <p v-if="error" class="error">{{ error }}</p>
+      <p>
+        Mode :
+        <span :class="online ? 'online' : 'offline'">
+          {{ online ? 'ONLINE (sync activée)' : 'OFFLINE (local seulement)' }}
+        </span>
+      </p>
+      <button class="btn small" @click="toggleOnline">
+        Passer en mode {{ online ? 'OFFLINE' : 'ONLINE' }}
+      </button>
+      <button class="btn small secondary" @click="manualSync">
+        Sync manuel (2 sens)
+      </button>
+    </section>
 
-    <!-- 📝 Formulaire d'ajout -->
+    <!-- Formulaire d'ajout -->
     <div class="form">
       <h2>Ajouter un document</h2>
 
@@ -161,14 +411,44 @@ onMounted(async () => {
         v-model="newPost.attributes"
         placeholder="Attributs séparés par des virgules"
         type="text"
-        @input="newPost.attributes = ($event.target as HTMLInputElement).value.split(',')"
+        @input="
+          newPost.attributes = ($event.target as HTMLInputElement).value
+            .split(',')
+            .map(s => s.trim())
+        "
       />
-      <button @click="addPost">Ajouter</button>
+      <div class="row">
+        <button @click="addPost">Ajouter</button>
+        <button class="secondary" @click="seedFactory(20)">
+          Générer 20 docs (factory)
+        </button>
+      </div>
     </div>
 
     <hr />
 
-    <!-- 📃 Liste des documents -->
+    <!-- Recherche + tri -->
+    <section class="search-bar">
+      <h2>Recherche & tri</h2>
+      <input
+        v-model="searchTerm"
+        @input="onSearchInput"
+        placeholder="Recherche exacte sur post_name…"
+        type="text"
+      />
+      <p class="search-help">
+        Tri actuel :
+        <strong>{{ sortByLikes ? 'par likes (index DB)' : 'par date (created_at)' }}</strong>
+      </p>
+      <button class="btn small secondary" @click="toggleSortLikes">
+        {{ sortByLikes ? 'Trier par date' : 'Trier par likes' }}
+      </button>
+      <button class="btn small secondary" @click="fetchData">
+        Rafraîchir
+      </button>
+    </section>
+
+    <!-- Liste des documents -->
     <div v-if="postsData.length === 0">
       <p>Aucune donnée trouvée.</p>
     </div>
@@ -183,16 +463,56 @@ onMounted(async () => {
         <h2>{{ post.post_name }}</h2>
         <p>{{ post.post_content }}</p>
         <p>Attributs : {{ (post.attributes || []).join(', ') }}</p>
+        <p class="meta">
+          <small>Créé : {{ post.created_at }}</small>
+          <span v-if="post.updated_at">
+            • <small>Modifié : {{ post.updated_at }}</small>
+          </span>
+          • <small>Likes : {{ post.likes || 0 }}</small>
+        </p>
+
         <div class="row">
-          <button @click="startEdit(post)">✏️ Modifier</button>
+          <button @click="startEdit(post)">Modifier</button>
           <button @click="deletePost(post._id, post._rev)">🗑️ Supprimer</button>
+          <button class="secondary" @click="likePost(post)">❤️ Like</button>
+        </div>
+
+        <!-- Commentaires -->
+        <div class="comments">
+          <h3>Commentaires</h3>
+          <p v-if="!post.comments || post.comments.length === 0" class="empty">
+            Aucun commentaire.
+          </p>
+          <ul v-else class="comments-list">
+            <li v-for="(c, idx) in post.comments" :key="idx">
+              <span class="comment-text">{{ c.text }}</span>
+              <span class="comment-date">({{ c.created_at }})</span>
+            </li>
+          </ul>
+
+          <div v-if="post._id" class="comment-form">
+            <input
+              type="text"
+              :placeholder="'Nouveau commentaire…'"
+              :value="getCommentDraft(post._id)"
+              @input="
+                setCommentDraft(
+                  post._id!,
+                  ($event.target as HTMLInputElement).value
+                )
+              "
+            />
+            <button class="secondary small" type="button" @click="addComment(post)">
+              Ajouter
+            </button>
+          </div>
         </div>
       </template>
 
       <!-- Mode édition -->
       <template v-else>
         <div class="editBox">
-          <h3>✏️ Modifier le document</h3>
+          <h3>Modifier le document</h3>
           <input
             v-model="editingPost.post_name"
             placeholder="Nom (post_name)"
@@ -207,11 +527,16 @@ onMounted(async () => {
             :value="(editingPost.attributes || []).join(', ')"
             placeholder="Attributs (séparés par des virgules)"
             type="text"
-            @input="editingPost && (editingPost.attributes = ($event.target as HTMLInputElement).value.split(',').map(s => s.trim()))"
+            @input="
+              editingPost &&
+                (editingPost.attributes = ($event.target as HTMLInputElement).value
+                  .split(',')
+                  .map(s => s.trim()))
+            "
           />
           <div class="row">
-            <button @click="updatePost">✅ Enregistrer</button>
-            <button @click="cancelEdit">❌ Annuler</button>
+            <button @click="updatePost">Enregistrer</button>
+            <button @click="cancelEdit">Annuler</button>
           </div>
         </div>
       </template>
@@ -223,11 +548,19 @@ onMounted(async () => {
 .container {
   padding: 1.5rem;
   color: white;
-  max-width: 720px;
+  max-width: 900px;
   margin: auto;
 }
-.actions {
+.status-bar {
   margin-bottom: 1rem;
+}
+.online {
+  color: #4caf50;
+  font-weight: bold;
+}
+.offline {
+  color: #f44336;
+  font-weight: bold;
 }
 .form {
   display: flex;
@@ -235,7 +568,15 @@ onMounted(async () => {
   gap: 0.5rem;
   margin-bottom: 1.5rem;
 }
-input {
+.search-bar {
+  margin: 1rem 0;
+}
+.search-help {
+  font-size: 0.85rem;
+  opacity: 0.8;
+}
+input,
+textarea {
   padding: 0.5rem;
   border-radius: 4px;
   border: none;
@@ -243,13 +584,23 @@ input {
 button {
   background: #42b883;
   color: white;
-  padding: 0.5rem;
+  padding: 0.5rem 0.8rem;
   border: none;
   cursor: pointer;
   border-radius: 4px;
 }
+button.secondary {
+  background: #2f4858;
+}
+button.danger {
+  background: #e53935;
+}
+button.small {
+  font-size: 0.8rem;
+  padding: 0.3rem 0.6rem;
+}
 button:hover {
-  background: #2a9d6e;
+  opacity: 0.9;
 }
 .item {
   background: #1e1e1e;
@@ -268,4 +619,30 @@ button:hover {
   border-radius: 8px;
   background: #17221f;
 }
+.meta {
+  font-size: 0.8rem;
+  opacity: 0.9;
+}
+.comments {
+  margin-top: 0.75rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #333;
+}
+.comments-list {
+  list-style: none;
+  padding-left: 0;
+}
+.comment-text {
+  margin-right: 0.3rem;
+}
+.empty {
+  font-size: 0.85rem;
+  opacity: 0.7;
+}
+.comment-form {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
 </style>
+
