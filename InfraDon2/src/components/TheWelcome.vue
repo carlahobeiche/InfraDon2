@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import PouchDB from 'pouchdb'
 import PouchDBFind from 'pouchdb-find'
 
@@ -45,9 +45,9 @@ const editingPost = ref<Post | null>(null)
 const loading = ref(false)
 const error = ref<string | null>(null)
 
-const online = ref(true)           // toggle online/offline
-const searchTerm = ref('')         // recherche par post_name
-const sortByLikes = ref(false)     // tri par likes
+const online = ref(true) // toggle online/offline
+const searchTerm = ref('') // recherche par post_name
+const sortByLikes = ref(false) // tri par likes
 
 // brouillon de commentaire par document
 const commentDrafts = ref<Record<string, string>>({})
@@ -109,6 +109,9 @@ const manualSync = async () => {
   await replicateToRemote()
 }
 
+// alias plus parlant
+const fullSync = manualSync
+
 // sync live (online)
 const startLiveSync = () => {
   const local = initLocalDb()
@@ -142,32 +145,21 @@ const toggleOnline = async () => {
 
 // ---------- CRUD ----------
 
-// READ – toutes les données (local DB)
+// READ – toutes les données (local DB), tri par date
 const fetchData = async () => {
   const db = initLocalDb()
   loading.value = true
   error.value = null
   try {
-    if (sortByLikes.value) {
-      // tri par likes côté DB
-      const res = await (db as any).find({
-        selector: {
-          likes: { $gte: 0 },
-        },
-        sort: [{ likes: 'desc' }],
-      })
-      postsData.value = (res.docs as any[]).map(normalizePost)
-    } else {
-      const result = await db.allDocs({ include_docs: true })
-      postsData.value = result.rows
-        .filter((r: any) => r.doc)
-        .map((r: any) => normalizePost(r.doc))
-        .sort(
-          (a, b) =>
-            new Date(b.created_at || '').getTime() -
-            new Date(a.created_at || '').getTime()
-        )
-    }
+    const result = await db.allDocs({ include_docs: true })
+    postsData.value = result.rows
+      .filter((r: any) => r.doc)
+      .map((r: any) => normalizePost(r.doc))
+      .sort(
+        (a, b) =>
+          new Date(b.created_at || '').getTime() -
+          new Date(a.created_at || '').getTime()
+      )
   } catch (e: any) {
     console.error(e)
     error.value = 'Erreur fetchData : ' + e.message
@@ -287,9 +279,8 @@ const likePost = async (post: Post) => {
   }
 }
 
-const toggleSortLikes = async () => {
+const toggleSortLikes = () => {
   sortByLikes.value = !sortByLikes.value
-  await fetchData()
 }
 
 // ---------- Commentaires ----------
@@ -343,22 +334,69 @@ const seedFactory = async (n = 20) => {
   if (online.value) await manualSync()
 }
 
+// ---------- Top 10 les plus likés ----------
+const fetchTop10Liked = async () => {
+  const db = initLocalDb()
+  try {
+    const res = await (db as any).find({
+      selector: { likes: { $gte: 0 } },
+      sort: [{ likes: 'desc' }],
+      limit: 10,
+    })
+    postsData.value = (res.docs as any[]).map(normalizePost)
+  } catch (e: any) {
+    console.error('Erreur fetchTop10Liked :', e)
+  }
+}
+
 // ---------- Recherche (indexée) ----------
 const onSearchInput = async () => {
   const db = initLocalDb()
   const term = searchTerm.value.trim()
-  if (!term) {
+
+  // si aucun terme et tri désactivé → on revient à la vue normale
+  if (!term && !sortByLikes.value) {
     await fetchData()
     return
   }
-  // recherche via index post_name
-  const res = await (db as any).find({
-    selector: {
-      post_name: { $eq: term },
-    },
-  })
-  postsData.value = (res.docs as any[]).map(normalizePost)
+
+  const selector: any = {}
+
+  if (term) {
+    // recherche partielle sur le nom
+    selector.post_name = { $regex: term }
+  }
+  if (sortByLikes.value) {
+    selector.likes = { $gte: 0 }
+  }
+
+  const query: any = {
+    selector: Object.keys(selector).length ? selector : { _id: { $gte: null } },
+  }
+
+  if (sortByLikes.value) {
+    query.sort = [{ likes: 'desc' }]
+  }
+
+  try {
+    const res = await (db as any).find(query)
+    postsData.value = (res.docs as any[]).map(normalizePost)
+  } catch (e: any) {
+    console.error('Erreur onSearchInput :', e)
+  }
 }
+
+// ---------- Watchers ----------
+watch(online, async value => {
+  if (value) {
+    await fullSync()
+  }
+})
+
+// relance la recherche/tri automatiquement
+watch([searchTerm, sortByLikes], () => {
+  onSearchInput()
+})
 
 // ---------- Lifecycle ----------
 onMounted(async () => {
@@ -433,7 +471,7 @@ onMounted(async () => {
       <input
         v-model="searchTerm"
         @input="onSearchInput"
-        placeholder="Recherche exacte sur post_name…"
+        placeholder="Recherche par post_name…"
         type="text"
       />
       <p class="search-help">
@@ -445,6 +483,9 @@ onMounted(async () => {
       </button>
       <button class="btn small secondary" @click="fetchData">
         Rafraîchir
+      </button>
+      <button class="btn small secondary" @click="fetchTop10Liked">
+        Top 10 les plus likés
       </button>
     </section>
 
@@ -545,6 +586,7 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+/* ton CSS inchangé */
 .container {
   padding: 1.5rem;
   color: white;
@@ -645,4 +687,5 @@ button:hover {
   margin-top: 0.5rem;
 }
 </style>
+
 
